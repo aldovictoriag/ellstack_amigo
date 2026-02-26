@@ -1,0 +1,16 @@
+﻿<service>
+  <id>ellStackAINodel</id>
+  <name>Ellstack AI model</name>
+  <description>ellStack AI Model</description>
+
+  <executable>%ELLSTACK_DIR%\bin\service\ellStackAImodel.bat</executable>
+
+  <workingdirectory>%ELLSTACK_DIR%</workingdirectory>
+
+  <log mode="roll">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+
+  <onfailure action="restart" delay="10 sec"/>
+</service>

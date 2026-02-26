@@ -1,0 +1,16 @@
+﻿<service>
+  <id>ellStackAIApi</id>
+  <name>ellStack AI Api </name>
+  <description>ellStack AI Api</description>
+
+  <executable>%ELLSTACK_DIR%\ellstack_api.exe</executable>
+ 
+  <workingdirectory>%ELLSTACK_DIR%</workingdirectory>
+
+  <log mode="roll">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+
+  <onfailure action="restart" delay="10 sec"/>
+</service>

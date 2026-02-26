@@ -1,0 +1,27 @@
+﻿# Binaries
+*.exe
+*.dll
+*.msi
+*.zip
+*.rar
+*.7z
+
+# Build folders
+build/
+dist/
+release/
+output/
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Large assets
+models/
+*.bin

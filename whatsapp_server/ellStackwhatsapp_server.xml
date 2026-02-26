@@ -1,0 +1,18 @@
+﻿<service>
+  <id>ellStackWhatsapp_serveri</id>
+  <name>ellStack Whatsapp_server</name>
+  <description>ellStack AI Model API</description>
+
+  <executable>C:\Program Files\nodejs\node.exe</executable>
+   <arguments>
+    api_send_sms_whastapp_baileys.js
+  </arguments>
+  <workingdirectory>%ELLSTACK_DIR%\whatsapp_server</workingdirectory>
+
+  <log mode="roll">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+
+  <onfailure action="restart" delay="10 sec"/>
+</service>

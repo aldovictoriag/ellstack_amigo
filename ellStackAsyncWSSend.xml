@@ -1,0 +1,17 @@
+﻿<service>
+       
+  <id>ellStackAsyncWSSend</id>
+  <name>ellStack AsyncWSSend</name>
+  <description>ellStack AsyncWSSend</description>
+
+  <executable>%ELLSTACK_DIR%\ellStackAsyncWSSend.bat</executable>
+ 
+  <workingdirectory>%ELLSTACK_DIR%\</workingdirectory>
+
+  <log mode="roll">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+
+  <onfailure action="restart" delay="10 sec"/>
+</service>
