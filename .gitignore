@@ -5,12 +5,21 @@
 *.zip
 *.rar
 *.7z
+*.log
+*.old
+*.dat
+*.err.log.old
+*.csv
 
 # Build folders
 build/
 dist/
 release/
 output/
+auth_info/
+temp/
+rag_data/
+data/
 
 # Node
 node_modules/
