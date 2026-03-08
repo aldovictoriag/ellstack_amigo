@@ -49,10 +49,10 @@ async function startWhatsApp() {
     
 // Reenviar mensajes entrantes a un webhook
 
-const WEBHOOK_URL = 'http://localhost:8082/wsxwh';
+let WEBHOOK_URL = '';
 
 let enviarRecibidos = true;    // Control para mensajes recibidos
-let enviarEnviados = false;    // Control para+ mensajes enviados
+let enviarEnviados = true;    // Control para+ mensajes enviados
 let enviarGrupos = false;      // Control para mensajes que vienen de grupos
 
 sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -92,6 +92,14 @@ sock.ev.on('messages.upsert', async ({ messages, type }) => {
       else {
         continue; // Ignorar otros tipos
       }
+
+    if (msg.key.fromMe) 
+    {
+       WEBHOOK_URL = "http://localhost:8082/wsxwhenv";
+    }  
+      else 
+        WEBHOOK_URL = "http://localhost:8082/wsxwh";   
+
 
       // Obtener nombre del remitente si existe
       const contacto = await sock.onWhatsApp(sender.split('@')[0]);
@@ -400,7 +408,19 @@ const Database = require('better-sqlite3');
 
 const db = new Database(dbPath);
 
+ 
+    // Get all pending messages
+    const pendingMessages = db.prepare(`
+        SELECT param_value FROM local_setting WHERE param='TRAINING_MODE' LIMIT 1
+    `).all();
 
+    for (const PO of pendingMessages) {
+
+           if (PO.param_value === 'ON')
+              return "Training mode";
+            
+        }        
+      
 
 // Prepare insert statement
 const insert = db.prepare(`
@@ -567,7 +587,141 @@ const insertMessageStmt = db.prepare(`
 
 });
 
+app.post("/wsxwhenv", async function (req, rs) {
 
+const bodyParser = require("body-parser");
+const Database = require("better-sqlite3");
+
+ 
+app.use(bodyParser.json());
+
+/* ==============================
+   SQLite Connection (High Performance)
+============================== */
+
+const db = new Database(dbPath, {
+  verbose: console.log
+});
+
+// Crear tabla si no existe
+db.exec(`
+  CREATE TABLE IF NOT EXISTS whatsapp_Outbound_message_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    receive_date TEXT,
+    message TEXT,
+    from_phone TEXT,
+    to_phone TEXT,
+    status TEXT
+  );
+
+ 
+`);
+
+// Prepared statement (más rápido)
+const insertMessageStmt = db.prepare(`
+  INSERT INTO whatsapp_Outbound_message_queue
+  (receive_date, message, from_phone, to_phone, status)
+  VALUES (?, ?, ?, ?, ?)
+`);
+
+const updateMessageStmt = db.prepare(`
+update whatsapp_Inbound_message_queue  
+set human_respond  =  COALESCE(human_respond, '') || ' ' ||  ?
+where id = (select max(id) from whatsapp_Inbound_message_queue w2
+where  w2.to_phone = ?)
+
+`);
+
+
+  try {
+
+    const bodyData = req.body;
+
+    
+    /* ==============================
+       Variables
+    ============================== */
+
+    var cell_phone = req.body.from;
+    var email = cell_phone + '@nomail.com';
+    var to_phone = req.body.to;
+    var mensaje = req.body.message;
+
+    var sesion = '3h43n34242n3423SFxA3@!KAFA0322l232%';
+    var usuario_prov = '';
+    var agente = '';
+    var channel_actualizado = 'Whatsapp';
+    var nombre = cell_phone;
+    var apellido = '';
+    var tipo_prospecto = 'C';
+
+    /* ==============================
+       Fechas
+    ============================== */
+
+    var startDate = new Date();
+    var endDate = new Date();
+
+    startDate.setDate(startDate.getDate() + 1);
+    startDate.setHours(4, 0, 0, 0);
+
+    endDate.setDate(endDate.getDate() + 3);
+    endDate.setHours(4, 59, 0, 0);
+
+    function formatDateToYYYYMMDD(date) {
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    }
+
+   
+    var dateMsg = new Date();
+    var receiveDate = dateMsg.toLocaleString('es-US', {
+      timeZone: 'America/Santo_Domingo'
+    });
+
+    const result = insertMessageStmt.run(
+      receiveDate,
+      mensaje,
+      cell_phone,
+      to_phone,
+      'Completed'
+    );
+
+    const mensajeGuardadoId = result.lastInsertRowid;
+
+
+      
+     
+    updateMessageStmt.run(
+      
+      mensaje,
+      to_phone
+     
+    );
+
+    /* ==============================
+       Response
+    ============================== */
+
+    rs.json({
+      success: true,
+      messageId: mensajeGuardadoId
+    });
+
+  } catch (error) {
+
+    console.error("Error in /wsxwhenv:", error);
+
+    rs.status(500).json({
+      success: false,
+      error: error.message
+    });
+
+  }
+
+});
 
 
 
@@ -698,7 +852,9 @@ app.post("/aibres", async function (req, rs) {
   // ===============================
   // 5️⃣ SEND WHATSAPP IF VALID RESPONSE
   // ===============================
-  if (respond && respond !== 'Information not found.') {
+  if ((respond && respond !== 'Information not found.') ||  (respond !== 'MAX MESSAGE PER CUSTOMER REACHED')) 
+    
+    {
     whatsappsend(ordenes2.from_phone, respond, 'false', '8082');
   }
 

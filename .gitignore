@@ -20,6 +20,7 @@ auth_info/
 temp/
 rag_data/
 data/
+venv/
 
 # Node
 node_modules/

@@ -6,6 +6,15 @@ import win32service
 import pywintypes
 import requests
 import json
+import sqlite3
+
+BASE_DIR = os.environ.get("ELLSTACK_DIR")
+
+if not BASE_DIR:
+    raise EnvironmentError("ELLSTACK_DIR environment variable is not defined")
+
+SQLITE_DB = os.path.join(BASE_DIR,'data', "ellsdb")
+
 
 
 
@@ -22,14 +31,41 @@ headers = {
     "Content-Type": "application/json"
 }
 
+def get_training_mode():
+    try:
+        conn = sqlite3.connect(SQLITE_DB)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT param_value FROM local_setting WHERE param='TRAINING_MODE' LIMIT 1"
+        )
+
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            return row[0]
+        return 'OFF'
+
+    except Exception as e:
+        print("SQLite error:", e)
+        return 'OFF'
+
+
+
 def send_request():
     try:
-        response = requests.post(
-            URL,
-            headers=headers,
-            data=json.dumps(payload),
-            timeout=30
-        )
+
+        ai_training_mode = get_training_mode()
+
+        if ai_training_mode == 'OFF':
+            response = requests.post(
+                URL,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=30
+            )
+
         print("Status:", response.status_code)
         print("Response:", response.json())
     except Exception as e:
