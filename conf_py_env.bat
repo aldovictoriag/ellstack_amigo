@@ -3,6 +3,6 @@
 python -m venv venv
 
 venv\Scripts\python.exe -m pip install --upgrade pip
-venv\Scripts\python.exe -m pip install langchain chromadb fastapi uvicorn sentence-transformers faiss-cpu redis pywin32 pandas pdfplumber python-docx 
+venv\Scripts\python.exe -m pip install langchain chromadb fastapi uvicorn sentence-transformers faiss-cpu redis pywin32 pandas pdfplumber python-docx openpyxl
 venv\Scripts\python.exe -m pywin32_postinstall -install
 
