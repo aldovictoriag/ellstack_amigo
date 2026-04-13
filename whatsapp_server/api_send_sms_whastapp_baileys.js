@@ -1,5 +1,12 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason,fetchLatestWaWebVersion } = require('@whiskeysockets/baileys');
+const { 
+    default: makeWASocket, 
+    useMultiFileAuthState, 
+    DisconnectReason,
+    fetchLatestWaWebVersion,
+    downloadContentFromMessage   // ✅ NEW
+} = require('@whiskeysockets/baileys');
+
 const QRCode = require('qrcode');
 const qrcode = require('qrcode-terminal')
 const P = require('pino');
@@ -7,7 +14,29 @@ const path = require('path');
 const fs = require('fs'); // Para guardar logs en archivo
 const Papa = require('papaparse');
 const axios = require('axios'); 
+const ffmpeg = require('fluent-ffmpeg');  
 
+const { createClient } = require('redis');
+
+const redisClient = createClient({
+  url: 'redis://localhost:6379'
+});
+
+redisClient.on('error', err => console.error('Redis error', err));
+
+
+
+// connect safely (no top-level await)
+// ✅ wrap in async function
+async function initRedis() {
+  try {
+    await redisClient.connect();
+  } catch (err) {
+    console.error(' Redis connection error:', err);
+  }
+}
+
+initRedis();
 
 //CARPETA PARA TEMPORALES
 process.env.TMPDIR = path.join(__dirname, 'temp');
@@ -17,6 +46,138 @@ process.env.TMP = path.join(__dirname, 'temp');
 const app = express();
 app.use(express.json()); // Para parsear JSON
 
+ 
+
+ 
+async function cleanLLMSpam(session_id, text) {
+  try {
+    text = String(text || '').replace(/\s+/g, ' ').trim();
+
+    const sentences = text.split(/(?<=[\.\?\!])\s+/);
+
+    const key = `chat:${session_id}`;
+    const history = await redisClient.lRange(key, -5, -1);
+
+    const previousSentences = new Map(); // normalized -> count
+
+    // 🔹 Load Redis history
+    for (const item of history) {
+      try {
+        const msg = JSON.parse(item);
+
+        if (msg.role === "assistant" && msg.content) {
+          const count = msg.count || 0;
+
+          const split = msg.content.split(/(?<=[\.\?\!])\s+/);
+
+          for (let s of split) {
+            const norm = normalizeText(s);
+            if (norm) {
+              previousSentences.set(
+                norm,
+                Math.max(previousSentences.get(norm) || 0, count)
+              );
+            }
+          }
+        }
+      } catch {}
+    }
+
+    const seen = [];
+    const result = [];
+
+    for (let sentence of sentences) {
+      const cleaned = sentence.trim();
+      const normalized = normalizeText(cleaned);
+
+      if (!normalized) continue;
+
+      const previousCount = previousSentences.get(normalized) || 0;
+
+      // Check similarity against already accepted sentences
+      const isDuplicateLocal = seen.some(s => isSimilar(s, normalized));
+
+      // Check similarity against Redis history
+      const isDuplicateHistory = [...previousSentences.keys()]
+        .some(prev => isSimilar(prev, normalized));
+
+      if (
+        !isDuplicateLocal &&
+        !isDuplicateHistory &&
+        previousCount <= 1
+      ) {
+        seen.push(normalized);
+        result.push(cleaned);
+      }
+    }
+
+    const finalText = result.join(' ').trim();
+
+    return finalText || text;
+
+  } catch (err) {
+    console.error("cleanLLMSpam error:", err);
+    return String(text || '');
+  }
+}
+
+function formatDateToYYYYMMDD(date) {
+  const d = (date instanceof Date) ? date : new Date(date);
+
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+
+  const hours = String(d.getHours()).padStart(2, '0');
+  const minutes = String(d.getMinutes()).padStart(2, '0');
+  const seconds = String(d.getSeconds()).padStart(2, '0');
+
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+
+//////////////////////////////////////////////////////
+// ✅ AUDIO SAVE FUNCTION
+//////////////////////////////////////////////////////
+async function saveAudioMessage(audioMessage, msgId) {
+    try {
+        const audioDir = path.join(ellstackDir, 'data', 'audio');
+
+        if (!fs.existsSync(audioDir)) {
+            fs.mkdirSync(audioDir, { recursive: true });
+        }
+
+        const stream = await downloadContentFromMessage(audioMessage, 'audio');
+
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) {
+            buffer = Buffer.concat([buffer, chunk]);
+        }
+
+        const tempOgg = path.join(audioDir, `${msgId}.ogg`);
+        const finalMp3 = path.join(audioDir, `${msgId}.mp3`);
+
+        fs.writeFileSync(tempOgg, buffer);
+
+        await new Promise((resolve, reject) => {
+            ffmpeg(tempOgg)
+                .toFormat('mp3')
+                .on('end', () => {
+                    fs.unlinkSync(tempOgg);
+                    resolve();
+                })
+                .on('error', reject)
+                .save(finalMp3);
+        });
+
+        return finalMp3;
+
+    } catch (err) {
+        console.error("Error saving audio:", err);
+        return null;
+    }
+}
+
 
 
 // Open database (it will create it if it doesn't exist)
@@ -24,6 +185,17 @@ app.use(express.json()); // Para parsear JSON
 const ellstackDir = process.env.ELLSTACK_DIR; // fallback if not set
 
 const dbPath = path.join(ellstackDir, 'data', 'ellsdb');
+
+
+const ffmpegPath = path.join(
+  process.env.ELLSTACK_DIR,
+  'decoder_audio',
+  'bin',
+  'ffmpeg.exe'
+);
+
+ffmpeg.setFfmpegPath(ffmpegPath);
+
 
 let sock;
 const MAX_RETRIES = 3; // Máximo número de intentos de reenvío
@@ -44,9 +216,7 @@ async function startWhatsApp() {
         });
 
         sock.ev.on('creds.update', saveCreds);
-
-
-    
+  
 // Reenviar mensajes entrantes a un webhook
 
 let WEBHOOK_URL = '';
@@ -54,6 +224,20 @@ let WEBHOOK_URL = '';
 let enviarRecibidos = true;    // Control para mensajes recibidos
 let enviarEnviados = true;    // Control para+ mensajes enviados
 let enviarGrupos = false;      // Control para mensajes que vienen de grupos
+
+
+async function transcribeAudio(filePath) {
+    try {
+        const response = await axios.post('http://localhost:8964/transcribe', {
+            path: filePath
+        });
+
+        return response.data.text || "";
+    } catch (err) {
+        console.error("Transcription error:", err.message);
+        return "";
+    }
+}
 
 sock.ev.on('messages.upsert', async ({ messages, type }) => {
   if (type !== 'notify') return;
@@ -64,6 +248,8 @@ sock.ev.on('messages.upsert', async ({ messages, type }) => {
       const isGroup = from.endsWith('@g.us');
       const sender = msg.key.participant || msg.key.remoteJid;
 
+
+     
 
       //ignorar mensajes de estados y otros
       if (msg.key.remoteJid === 'status@broadcast' || msg.key.id?.startsWith('BAE5') || msg.message?.protocolMessage) continue;
@@ -77,9 +263,44 @@ sock.ev.on('messages.upsert', async ({ messages, type }) => {
 
       let text = '';
 
+      if (msg.key.fromMe) 
+          {
+            WEBHOOK_URL = "http://localhost:8082/wsxwhenv";
+          }  
+            else 
+              WEBHOOK_URL = "http://localhost:8082/wsxwh";   
+
+  
       // Detectar si es audio
       if (msg.message?.audioMessage) {
-        text = '[Mensaje de audio]';
+           const msgId = msg.key.id;
+
+                        const audioPath = await saveAudioMessage(
+                            msg.message.audioMessage,
+                            msgId
+                        );
+
+                        let transcribedText = '';
+
+                        if (audioPath) {
+                            transcribedText = await transcribeAudio(audioPath);
+                        }
+                        
+                        if (!transcribedText || transcribedText.trim() === '') {
+                           transcribedText = '[Audio without transcribe]';
+}
+ 
+
+                        await axios.post(WEBHOOK_URL, {
+                            from: sender.split('@')[0],
+                            name: '',
+                            message: transcribedText,
+                            audio_path: audioPath,
+                            to: sock.user.id.split(':')[0]
+                        });
+
+                       
+                        continue;
       }
       // Detectar texto plano
       else if (msg.message?.conversation) {
@@ -93,17 +314,12 @@ sock.ev.on('messages.upsert', async ({ messages, type }) => {
         continue; // Ignorar otros tipos
       }
 
-    if (msg.key.fromMe) 
-    {
-       WEBHOOK_URL = "http://localhost:8082/wsxwhenv";
-    }  
-      else 
-        WEBHOOK_URL = "http://localhost:8082/wsxwh";   
-
-
-      // Obtener nombre del remitente si existe
+   
+    // Obtener nombre del remitente si existe
       const contacto = await sock.onWhatsApp(sender.split('@')[0]);
-      const profileName = contacto?.[0]?.notify || 'Desconocido';
+      const profileName = contacto?.[0]?.notify || 'Desconocido';      
+
+    
 
       // Enviar al webhook
       await axios.post(WEBHOOK_URL, {
@@ -113,8 +329,7 @@ sock.ev.on('messages.upsert', async ({ messages, type }) => {
         to : sock.user.id.split(':')[0]
       });
 
-      console.log(`Mensaje de ${profileName} (${sender.split('@')[0]}) reenviado al webhook - contenido: ${text}`);
-
+      
     } catch (err) {
       console.error('Error al reenviar mensaje al webhook:', err);
     }
@@ -246,10 +461,8 @@ app.post('/send-message', async (req, res) => {
         await sendMessageWithRetries(`${number + adic}`, messageOptions, MAX_RETRIES);
 
         if (imageUrl) {
-            console.log('Message with image sent successfully');
             res.status(200).send('Message with image sent successfully');
         } else {
-            console.log('Text message sent successfully');
             res.status(200).send('Text message sent successfully');
         }
     } catch (error) {
@@ -298,7 +511,6 @@ app.get('/get-groups', async (req, res) => {
         // Guardar en un archivo CSV
         fs.writeFileSync('groups.csv', csvData, 'utf8');
 
-        console.log('Detalles de grupos guardados en groups.csv');
         res.status(200).json({ message: 'Detalles de grupos guardados en CSV', groups: groupDetails });
 
     } catch (error) {
@@ -338,7 +550,6 @@ app.post('/add-to-all-groups', async (req, res) => {
                 results.push({ groupId, status: 'success', result });
 
                 // Espera 2 minutos antes de agregar al siguiente grupo
-                console.log(`Esperando 2 minutos antes de procesar el siguiente grupo...`);
                 await new Promise(resolve => setTimeout(resolve, 2 * 60 * 1000));
             } catch (error) {
                 console.error(`Error agregando al grupo ${groupId}:`, error);
@@ -447,6 +658,81 @@ insert.run(
 };  
 
 
+async function ai_send(from_phone,from_id,mensaje,to_phone) {
+
+const Database = require('better-sqlite3');
+
+
+const db = new Database(dbPath);
+
+
+    var dateMsg = new Date();
+    var receiveDate = formatDateToYYYYMMDD(dateMsg.toLocaleString('en-US', {
+      timeZone: 'America/Santo_Domingo'
+    }));
+
+ 
+
+    const existingRecord = db.prepare(`
+      SELECT id FROM ai_message_queue
+      WHERE from_phone = ? and status  = 'Pending'
+      LIMIT 1
+    `).get(from_phone);
+
+    
+
+    if (existingRecord) {
+      // Record found — use to_phone directly
+      console.log(`ai message record found for ${from_phone}, updating directly.`);
+     
+      const  insert = db.prepare(`
+        update ai_message_queue set message = COALESCE(message, '') || '. ' ||  ?,
+        updatedAt = ?,from_id = ?
+        where from_phone = ? and status  = 'Pending'
+    `);
+
+      insert.run(
+      mensaje,
+      receiveDate,
+      from_id,
+      from_phone,
+      );
+    
+    }
+    else 
+        {
+
+        // Prepare insert statement
+        const insert = db.prepare(`
+            INSERT INTO ai_message_queue
+            (from_phone,from_id, message,to_phone,createdAt,status)
+            VALUES (?, ?, ?, ?, ?,?)
+        `);
+
+        
+        // Execute insert
+        insert.run(
+            from_phone,
+            from_id,
+            mensaje,
+            to_phone,
+            receiveDate,
+            'Pending' 
+        ); 
+
+        }
+    
+ 
+
+// Execute insert
+
+ db.close();
+  
+
+};  
+
+
+
 /* ==============================
    Webhook Endpoint
 ============================== */
@@ -464,7 +750,7 @@ app.use(bodyParser.json());
 ============================== */
 
 const db = new Database(dbPath, {
-  verbose: console.log
+  //verbose: console.log
 });
 
 // Crear tabla si no existe
@@ -484,8 +770,8 @@ db.exec(`
 // Prepared statement (más rápido)
 const insertMessageStmt = db.prepare(`
   INSERT INTO whatsapp_Inbound_message_queue
-  (receive_date, message, from_phone, to_phone, status)
-  VALUES (?, ?, ?, ?, ?)
+  (receive_date, message, from_phone, to_phone, status,in_audio_path)
+  VALUES (?, ?, ?, ?, ?,?)
 `);
 
 
@@ -502,6 +788,11 @@ const insertMessageStmt = db.prepare(`
     var email = cell_phone + '@nomail.com';
     var to_phone = req.body.to;
     var mensaje = req.body.message;
+    var audio_path = ''
+
+    if (req.body.audio_path)
+       audio_path = req.body.audio_path
+       
 
     var sesion = '3h43n34242n3423SFxA3@!KAFA0322l232%';
     var usuario_prov = '';
@@ -524,25 +815,21 @@ const insertMessageStmt = db.prepare(`
     endDate.setDate(endDate.getDate() + 3);
     endDate.setHours(4, 59, 0, 0);
 
-    function formatDateToYYYYMMDD(date) {
-      const year = date.getFullYear();
-      const month = String(date.getMonth() + 1).padStart(2, '0');
-      const day = String(date.getDate()).padStart(2, '0');
-      return `${year}-${month}-${day}`;
-    }
+    
 
    
     var dateMsg = new Date();
-    var receiveDate = dateMsg.toLocaleString('es-US', {
+    var receiveDate = formatDateToYYYYMMDD(dateMsg.toLocaleString('en-US', {
       timeZone: 'America/Santo_Domingo'
-    });
+    }));
 
     const result = insertMessageStmt.run(
       receiveDate,
       mensaje,
       cell_phone,
       to_phone,
-      'Pending'
+      'Pending',
+      audio_path
     );
 
     const mensajeGuardadoId = result.lastInsertRowid;
@@ -551,23 +838,16 @@ const insertMessageStmt = db.prepare(`
     
 
      
-    /* ==============================
-       AI Response (si aplica)
-    ============================== */
-
    
-
-       // Enviar al webhook
-      await axios.post('http://localhost:8082/aibres', {
-       param1: mensaje,
-       param2: mensajeGuardadoId
-      });
 
   
 
     /* ==============================
        Response
     ============================== */
+   
+    //enviar a cola de proceso para la IA 
+    ai_send(cell_phone,mensajeGuardadoId,mensaje,to_phone) 
 
     rs.json({
       success: true,
@@ -585,6 +865,9 @@ const insertMessageStmt = db.prepare(`
 
   }
 
+
+
+
 });
 
 app.post("/wsxwhenv", async function (req, rs) {
@@ -600,7 +883,7 @@ app.use(bodyParser.json());
 ============================== */
 
 const db = new Database(dbPath, {
-  verbose: console.log
+  //verbose: console.log
 });
 
 // Crear tabla si no existe
@@ -620,17 +903,34 @@ db.exec(`
 // Prepared statement (más rápido)
 const insertMessageStmt = db.prepare(`
   INSERT INTO whatsapp_Outbound_message_queue
-  (receive_date, message, from_phone, to_phone, status)
-  VALUES (?, ?, ?, ?, ?)
+  (receive_date, message, from_phone, to_phone, status,audio_path,auto_match_phone)
+  VALUES (?, ?, ?, ?, ?,?,?)
 `);
+
 
 const updateMessageStmt = db.prepare(`
 update whatsapp_Inbound_message_queue  
-set human_respond  =  COALESCE(human_respond, '') || ' ' ||  ?
+set human_respond  =  COALESCE(human_respond, '') || ' ; ' ||  ?,training_status = ?,
+out_audio_path = ?,auto_match_phone_response = ?
 where id = (select max(id) from whatsapp_Inbound_message_queue w2
-where  w2.to_phone = ?)
+where  w2.from_phone = ?)
 
 `);
+
+//buscar si esta en entrenamiento
+
+let agent_training = '';
+
+const row = db.prepare(`
+    SELECT param_value 
+    FROM local_setting 
+    WHERE param = 'TRAINING_MODE'
+    LIMIT 1
+`).get();
+
+if (row?.param_value === 'ON') {
+   agent_training = 'Pending';
+}
 
 
   try {
@@ -642,9 +942,9 @@ where  w2.to_phone = ?)
        Variables
     ============================== */
 
-    var cell_phone = req.body.from;
+    var cell_phone = req.body.to;
     var email = cell_phone + '@nomail.com';
-    var to_phone = req.body.to;
+    var to_phone =  req.body.from;
     var mensaje = req.body.message;
 
     var sesion = '3h43n34242n3423SFxA3@!KAFA0322l232%';
@@ -654,6 +954,12 @@ where  w2.to_phone = ?)
     var nombre = cell_phone;
     var apellido = '';
     var tipo_prospecto = 'C';
+
+    var audio_path = ''
+
+    if (req.body.audio_path)
+       audio_path = req.body.audio_path
+       
 
     /* ==============================
        Fechas
@@ -668,38 +974,117 @@ where  w2.to_phone = ?)
     endDate.setDate(endDate.getDate() + 3);
     endDate.setHours(4, 59, 0, 0);
 
-    function formatDateToYYYYMMDD(date) {
-      const year = date.getFullYear();
-      const month = String(date.getMonth() + 1).padStart(2, '0');
-      const day = String(date.getDate()).padStart(2, '0');
-      return `${year}-${month}-${day}`;
-    }
+    
 
    
     var dateMsg = new Date();
-    var receiveDate = dateMsg.toLocaleString('es-US', {
+    var receiveDate = formatDateToYYYYMMDD(dateMsg.toLocaleString('en-US', {
       timeZone: 'America/Santo_Domingo'
-    });
+    }));
 
-    const result = insertMessageStmt.run(
+
+
+    /* Check if a record exists in whatsapp_Inbound_message_queue for this phone */
+
+    var mensajeGuardadoId = '';
+
+    const existingRecord = db.prepare(`
+      SELECT id FROM whatsapp_Inbound_message_queue
+      WHERE from_phone = ?
+      LIMIT 1
+    `).get(to_phone);
+
+    
+
+    if (existingRecord) {
+      
+      const result = insertMessageStmt.run(
       receiveDate,
       mensaje,
       cell_phone,
       to_phone,
-      'Completed'
+      'Completed',
+      audio_path,
+      ''
     );
 
-    const mensajeGuardadoId = result.lastInsertRowid;
+     mensajeGuardadoId = result.lastInsertRowid;
+
+      updateMessageStmt.run(
+        mensaje,
+        agent_training,
+        audio_path,
+        '',
+        to_phone
+      );
+    } 
+    else 
+      {
+      
+      try {
+      
+            const matcherDate = formatDateToYYYYMMDD(
+              new Date().toLocaleString('en-US', { timeZone: 'America/Santo_Domingo' })
+            );
+
+            const matcherResponse = await axios.post('http://localhost:8964/phone_ai_matcher', {
+              phone_number: to_phone,
+              date_send: matcherDate
+            });
+
+            const matchPhone = matcherResponse.data?.match_phone;
 
 
+
+            if (matchPhone) 
+               {
+                    const result = insertMessageStmt.run(
+                    receiveDate,
+                    mensaje,
+                    cell_phone,
+                    to_phone,
+                    'Completed',
+                    audio_path,
+                     matchPhone
+                    );
+                
+
+                    updateMessageStmt.run(
+                    mensaje,
+                    agent_training,
+                    audio_path,
+                    to_phone,
+                    matchPhone
+                  );
+
+                  mensajeGuardadoId = result.lastInsertRowid;
+
+               } 
+                    
+              else {
+
+                    const result = insertMessageStmt.run(
+                    receiveDate,
+                    mensaje,
+                    cell_phone,
+                    to_phone,
+                    'Completed',
+                    audio_path,
+                    ''
+                    );
+
+                    mensajeGuardadoId = result.lastInsertRowid;
+
+                   }
+          } 
       
-     
-    updateMessageStmt.run(
+      catch (matcherError) {
+            console.error('Error calling phone_ai_matcher:', matcherError.message);
+            // Fall through with original to_phone
+      }
+
       
-      mensaje,
-      to_phone
-     
-    );
+    }
 
     /* ==============================
        Response
@@ -723,7 +1108,92 @@ where  w2.to_phone = ?)
 
 });
 
+function normalizeText(text) {
+  return String(text || '')
+    .normalize('NFKD')                 // remove accents
+    .replace(/[\u0300-\u036f]/g, '')   // remove diacritics
+    .toLowerCase()
+    .replace(/[^\w\s]/g, '')           // remove punctuation
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
+function isSimilar(a, b) {
+  if (!a || !b) return false;
+
+  // Exact match
+  if (a === b) return true;
+
+  // Partial overlap (substring)
+  if (a.includes(b) || b.includes(a)) return true;
+
+  // Token similarity (Jaccard-like)
+  const aWords = new Set(a.split(' '));
+  const bWords = new Set(b.split(' '));
+
+  let intersection = 0;
+  for (let w of aWords) {
+    if (bWords.has(w)) intersection++;
+  }
+
+  const similarity = intersection / Math.max(aWords.size, bWords.size);
+
+  return similarity > 0.8; // tweak threshold if needed
+}
+
+const CHAT_LIMIT = 20; // same as your Python constant
+
+async function getChatHistory(sessionId) {
+  const key = `chat:${sessionId}`;
+
+  const data = await redisClient.lRange(key, -CHAT_LIMIT, -1);
+
+  return data
+    .map(m => {
+      try {
+        return JSON.parse(m);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+} 
+
+
+async function getMessageCount(sessionId, role, content) {
+  const key = `chat:${sessionId}`;
+  const normalizedTarget = normalizeText(content);
+
+  try {
+    // Leer últimos mensajes (optimizado)
+    const messages = await redisClient.lRange(key, -20, -1);
+
+    // Buscar desde el más reciente al más antiguo
+    for (let i = messages.length - 1; i >= 0; i--) {
+      try {
+        const msg = JSON.parse(messages[i]);
+
+        if (!msg || msg.role !== role) continue;
+
+        if (normalizeText(msg.content) === normalizedTarget) {
+          return msg.count || 0;
+        }
+
+      } catch (err) {
+         
+
+        continue;
+      }
+    }
+
+    return 0;
+
+  } catch (err) {
+    console.error("Error getting message count:", err);
+    return 0;
+  }
+}
+ 
 
 app.post("/aibres", async function (req, rs) {
 
@@ -736,46 +1206,122 @@ app.post("/aibres", async function (req, rs) {
 
   let respond = '';
 
-  const id = req.body.param2;
-  const questionText = req.body.param1;
+ 
 
-
-  
   // Current timestamp
   const dateObj = new Date();
-  const sentToAiTime = dateObj.toLocaleString('es-US', { 
+  const sentToAiTime = formatDateToYYYYMMDD(dateObj.toLocaleString('en-US', { 
     timeZone: 'America/Santo_Domingo' 
-  });
+  }));
 
   // ===============================
   // 1️⃣ GET CURRENT RECORD
   // ===============================
   const getStmt = db.prepare(`
     SELECT * 
-    FROM whatsapp_Inbound_message_queue 
-    WHERE id = ?
+    FROM ai_message_queue 
+    WHERE status in ('Pending','Sent to AI','AI RESPOND ERROR RETRY') 
+    order by id 
   `);
 
-  const ordenes2 = getStmt.get(id);
-
-   
-
+  
+  const ordenes2 = getStmt.get();
 
   if (!ordenes2) {
 
    
-    console.log("Record not found:", id);
-    return "record not found";
+ 
+    rs.status(200).json({
+      success: true,
+      error: 'Pending message not found'
+    });
+
+
+    return 'ok';
   }
 
   
-  // ===============================
-  // 2️⃣ UPDATE STATUS -> Sent to AI
+  const id = ordenes2.id;
+  const questionText = ordenes2.message;
+  const from_phone = ordenes2.from_phone;
+  const original_sent_date =  ordenes2.sent_to_ai;
+  const from_id =  ordenes2.from_id;
+  const status =  ordenes2.status;
+
+
+  const now = new Date();
+
+ const server_date  = new Date(
+  now.toLocaleString('en-US', { timeZone: 'America/Santo_Domingo' })
+);
+
+  const sentDate = new Date(original_sent_date);
+  const diffMinutes = (server_date - sentDate) / 1000 / 60; // diferencia en minutos
+
+  if ((diffMinutes > 5) && (status == 'Sent to AI' || status == 'AI RESPOND ERROR RETRY'  ))  {
+     
+// ===============================
+  // 2️⃣ UPDATE STATUS -> ERROR
   // ===============================
   const updateSentStmt = db.prepare(`
-    UPDATE whatsapp_Inbound_message_queue
+    UPDATE ai_message_queue
     SET status = ?, 
-        sent_to_ai = ?
+        receive_from_ai = ?
+    WHERE id = ?
+  `);
+
+  updateSentStmt.run(
+    'AI_ERROR_TIME_OUT',
+    sentToAiTime,
+    id
+  );
+
+  
+  const updateCompletedStmt = db.prepare(`
+  UPDATE whatsapp_Inbound_message_queue
+  SET status = ?  
+  WHERE id <= ? and from_phone = ? and (status = 'Sent to AI' or status = 'AI RESPOND ERROR RETRY')
+  `);
+            
+
+  updateCompletedStmt.run(
+            'AI_ERROR_TIME_OUT',
+            from_id,
+            from_phone,
+           );
+
+
+  
+    rs.status(200).json({
+      success: false,
+      error: 'Error AI time_out'
+    });
+
+    return 'OK';
+     
+  }   
+ 
+  if (status == 'Sent to AI')
+     {
+        rs.status(200).json({
+          success: false,
+          error: 'Processing previous AI messages. No action done'
+        });
+
+       return 'OK'; 
+     }
+
+
+  // ===============================
+  // 2️⃣ UPDATE STATUS -> set to AI
+  // ===============================
+  const updateSentStmt = db.prepare(`
+    UPDATE ai_message_queue
+    SET status = ?, 
+        sent_to_ai = CASE 
+        WHEN sent_to_ai IS NULL THEN ? 
+        ELSE sent_to_ai 
+    END
     WHERE id = ?
   `);
 
@@ -784,6 +1330,24 @@ app.post("/aibres", async function (req, rs) {
     sentToAiTime,
     id
   );
+
+  
+  const updateSentToAIStmt = db.prepare(`
+  UPDATE whatsapp_Inbound_message_queue
+  SET status = ?,sent_to_ai = ? 
+  WHERE id <= ? and from_phone = ? and status = 'Pending'
+  `);
+            
+
+  updateSentToAIStmt.run(
+            'Sent to AI',
+            sentToAiTime,
+            from_id,
+            from_phone,
+           );
+  
+ 
+
 
 
   // ===============================
@@ -809,59 +1373,166 @@ app.post("/aibres", async function (req, rs) {
 
   try {
     const response = await axios.request(config);
-    respond = response.data.answer;
+    
+    respond_original = response.data.answer;
+
+    respond = await  cleanLLMSpam(ordenes2.from_phone,response.data.answer);
+
+    console.log('respond_original ' + respond_original);
+    console.log('respond ' + respond);
+    
+
   } catch (error) {
     console.log(error);
     console.log('error aibres ' + error.message);
   }
 
- 
+        let history = [];
+        try {
 
-  // ===============================
-  // 4️⃣ UPDATE RECORD AFTER AI RESPONSE
-  // ===============================
-  const dateObj2 = new Date();
-  const receiveFromAiTime = dateObj2.toLocaleString('es-US', { 
-    timeZone: 'America/Santo_Domingo' 
-  });
+        } catch (err) {
+        console.log('Redis history error:', err.message);
+        }
 
-  const diffMs = Math.abs(dateObj2 - dateObj);
-  const seconds = Math.floor(diffMs / 1000);
+      var cantidad_mensaje  = 0;
+      
+      cantidad_mensaje =  await getMessageCount(ordenes2.from_phone,'assistant',respond);
+        
+       
+      alreadyRespondedMoreThanOnce = cantidad_mensaje > 1;
+       
+              
+     if (
+            respond_original &&
+            respond_original.trim() !== ''  
 
-   
-  const updateCompletedStmt = db.prepare(`
-    UPDATE whatsapp_Inbound_message_queue
-    SET automatic_ai_respond = ?, 
-        status = ?, 
-        ai_processing_time = ?, 
-        receive_from_ai = ?
-    WHERE id = ?
-  `);
+            )
+     { 
 
-   
-  updateCompletedStmt.run(
-    respond,
-    'Completed',
-    seconds.toString(),
-    receiveFromAiTime,
-    id
-  );
+            // ===============================
+            // 4️⃣ UPDATE RECORD AFTER AI RESPONSE
+            // ===============================
+            const dateObj2 = new Date();
+            const receiveFromAiTime = formatDateToYYYYMMDD(dateObj2.toLocaleString('en-US', { 
+                timeZone: 'America/Santo_Domingo' 
+            }));
+
+            const diffMs = Math.abs(dateObj2 - dateObj);
+            const seconds = Math.floor(diffMs / 1000);
+
+            
+            const updateCompletedStmt = db.prepare(`
+                UPDATE whatsapp_Inbound_message_queue
+                SET automatic_ai_respond = ?, 
+                    status = ?, 
+                    ai_processing_time = ?, 
+                    receive_from_ai = ?
+                WHERE id <= ? and from_phone = ? and status = 'Sent to AI'
+            `);
+            
+            if  (respond.trim() == '')// after clean, all answer was not new
+                alreadyRespondedMoreThanOnce = true;
+                 
+
+            if (alreadyRespondedMoreThanOnce)
+               respond = 'Duplicated answer detected by model. Not sent to customer. Respond: ' + respond_original;
+
+           
+
+            updateCompletedStmt.run(
+                respond,
+                'Completed',
+                seconds.toString(),
+                receiveFromAiTime,
+                from_id,
+                from_phone,
+     
+            );
 
 
-   
-  // ===============================
-  // 5️⃣ SEND WHATSAPP IF VALID RESPONSE
-  // ===============================
-  if ((respond && respond !== 'Information not found.') ||  (respond !== 'MAX MESSAGE PER CUSTOMER REACHED')) 
+
+             const updateAiCompletedStmt = db.prepare(`
+                UPDATE ai_message_queue
+                SET automatic_ai_respond = ?, 
+                    status = ?, 
+                    ai_processing_time = ?, 
+                    receive_from_ai = ?
+                WHERE id = ? and from_phone = ? and status = 'Sent to AI'
+            `);
+            
+
+
+            updateAiCompletedStmt.run(
+                respond,
+                'Completed',
+                seconds.toString(),
+                receiveFromAiTime,
+                id,
+                from_phone,
+     
+            );
+
+            
+            // ===============================
+            // 5️⃣ SEND WHATSAPP IF VALID RESPONSE
+            // ===============================
+            if (
+                respond && !respond.toLowerCase().includes('information not found') &&
+                respond !== 'MAX MESSAGE PER CUSTOMER REACHED' && 
+                !alreadyRespondedMoreThanOnce 
+                )   
+                {
+                whatsappsend(ordenes2.from_phone, respond, 'false', '8082');
+            }
+    }
+    else  
+      {
+        //reintentar llamado
+          // Enviar al webhook
+  
+        const dateObj2 = new Date();
+        const receiveFromAiTime = formatDateToYYYYMMDD(dateObj2.toLocaleString('en-US', { 
+                timeZone: 'America/Santo_Domingo' 
+            }));   
+
+        const updateCompletedStmt = db.prepare(`
+                UPDATE ai_message_queue
+                SET status = ?
+                WHERE id = ?
+            `);
+            
+
+
+            updateCompletedStmt.run(
+                'AI RESPOND ERROR RETRY',
+                id
+            );
     
-    {
-    whatsappsend(ordenes2.from_phone, respond, 'false', '8082');
-  }
+       var dont_duplicate_text = '';
+
+       if (alreadyRespondedMoreThanOnce)
+          dont_duplicate_text = '\n \n give me a new respond different from: ' + respond;
+
+                
+
+
+       await axios.post('http://localhost:8082/aibres', {
+       param1: questionText,
+       param2: id
+      });
+
+        
+
+
+      }     
 
   // Close DB (optional but clean)
   db.close();
 
-  return 'ok';
+     rs.status(200).json({
+      success: true,
+      error: 'Ok'
+    });
 
 });
 
@@ -908,12 +1579,11 @@ app.post("/wssndque", async function (req, rs) {
                     headers: { 'Content-Type': 'application/json' }
                 });
 
-                console.log(`Message ID ${PO.id} sent successfully`);
-
+                
                 // Update status to completed
-                const dateObj = new Date().toLocaleString('es-US', {
+                const dateObj = formatDateToYYYYMMDD(new Date().toLocaleString('en-US', {
                     timeZone: 'America/Santo_Domingo'
-                });
+                }));
 
                 db.prepare(`
                     UPDATE whatsapp_message_queue
@@ -940,10 +1610,7 @@ app.post("/wssndque", async function (req, rs) {
 
 });
 
-
-
-
 const PORT = 8082;
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
-});
+}); 
