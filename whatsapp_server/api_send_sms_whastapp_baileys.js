@@ -51,16 +51,33 @@ app.use(express.json()); // Para parsear JSON
  
 async function cleanLLMSpam(session_id, text) {
   try {
-    text = String(text || '').replace(/\s+/g, ' ').trim();
+    // 🔥 eliminar basura desde "_score"
+    text = String(text || '').split('"_score"')[0];
 
-    const sentences = text.split(/(?<=[\.\?\!])\s+/);
+    text = text.replace(/\r/g, '');
+
+    // 🔹 Split por puntos, !, ? y saltos de línea
+    const sentences = text.split(/(?<=[\.\?\!])\s+|\n+/);
 
     const key = `chat:${session_id}`;
     const history = await redisClient.lRange(key, -5, -1);
 
-    const previousSentences = new Map(); // normalized -> count
+    const previousSentences = new Map();
 
-    // 🔹 Load Redis history
+    function normalizeText(text) {
+      return text
+        .toLowerCase()
+        .replace(/[^\w\s]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function isSimilar(a, b) {
+      if (!a || !b) return false;
+      return a.includes(b) || b.includes(a);
+    }
+
+    // 🔹 Historial
     for (const item of history) {
       try {
         const msg = JSON.parse(item);
@@ -68,7 +85,7 @@ async function cleanLLMSpam(session_id, text) {
         if (msg.role === "assistant" && msg.content) {
           const count = msg.count || 0;
 
-          const split = msg.content.split(/(?<=[\.\?\!])\s+/);
+          const split = msg.content.split(/(?<=[\.\?\!])\s+|\n+/);
 
           for (let s of split) {
             const norm = normalizeText(s);
@@ -83,7 +100,8 @@ async function cleanLLMSpam(session_id, text) {
       } catch {}
     }
 
-    const seen = [];
+    const seenExact = new Set();
+    const seenSimilar = [];
     const result = [];
 
     for (let sentence of sentences) {
@@ -91,29 +109,38 @@ async function cleanLLMSpam(session_id, text) {
       const normalized = normalizeText(cleaned);
 
       if (!normalized) continue;
+      if (seenExact.has(normalized)) continue;
 
       const previousCount = previousSentences.get(normalized) || 0;
 
-      // Check similarity against already accepted sentences
-      const isDuplicateLocal = seen.some(s => isSimilar(s, normalized));
+      const isDuplicateLocal = seenSimilar.some(s => isSimilar(s, normalized));
 
-      // Check similarity against Redis history
       const isDuplicateHistory = [...previousSentences.keys()]
         .some(prev => isSimilar(prev, normalized));
 
-      if (
-        !isDuplicateLocal &&
-        !isDuplicateHistory &&
-        previousCount <= 1
-      ) {
-        seen.push(normalized);
+      if (!isDuplicateLocal && !isDuplicateHistory && previousCount === 0) {
+        seenExact.add(normalized);
+        seenSimilar.push(normalized);
         result.push(cleaned);
       }
     }
 
-    const finalText = result.join(' ').trim();
+    let finalText = result.join('\n\n').trim();
 
-    return finalText || text;
+    if (!finalText) {
+      finalText = text.trim();
+    }
+
+    // 🔥 Formato WhatsApp
+    finalText = finalText
+      .replace(/\\n/g, '\n')
+      .replace(/\n\n/g, '\n \n')
+      .replace(/\n{3,}/g, '\n \n')
+      .trim();
+
+    whatsappsend('8094080064', finalText, false, 8082);
+
+    return finalText;
 
   } catch (err) {
     console.error("cleanLLMSpam error:", err);
@@ -318,8 +345,10 @@ sock.ev.on('messages.upsert', async ({ messages, type }) => {
     // Obtener nombre del remitente si existe
       const contacto = await sock.onWhatsApp(sender.split('@')[0]);
       const profileName = contacto?.[0]?.notify || 'Desconocido';      
-
+      
+      
     
+       
 
       // Enviar al webhook
       await axios.post(WEBHOOK_URL, {
@@ -665,6 +694,8 @@ const Database = require('better-sqlite3');
 
 const db = new Database(dbPath);
 
+var status = 'Pending';
+
 
     var dateMsg = new Date();
     var receiveDate = formatDateToYYYYMMDD(dateMsg.toLocaleString('en-US', {
@@ -673,9 +704,49 @@ const db = new Database(dbPath);
 
  
 
+      
+            const getLastInteractionStmt = db.prepare(`
+            SELECT last_interaction_date 
+            FROM prospect 
+            WHERE phone_number = ? or auto_match_phone = ?
+            `);
+
+            const getWaitTimeStmt = db.prepare(`
+            SELECT param_value 
+            FROM local_setting 
+            WHERE param = 'WAIT_TIME_USER_MANUAL_RESPONSE'
+          `);
+
+          let wait_manual_response = false;
+
+          // 1. Get last interaction date
+          const prospectRow = getLastInteractionStmt.get(from_phone,from_phone);
+
+            // 2. Get wait time (in minutes)
+            const waitRow = getWaitTimeStmt.get();
+
+            if (prospectRow && prospectRow.last_interaction_date && waitRow) {
+
+              const lastInteractionDate = new Date(prospectRow.last_interaction_date);
+              const now = new Date();
+
+              const waitMinutes = parseFloat(waitRow.param_value) || 0;
+
+              // Difference in minutes
+              const diffMs = now - lastInteractionDate;
+              const diffMinutes = diffMs / (1000 * 60);
+
+              // 3. Compare
+              if (diffMinutes < waitMinutes) {
+                 wait_manual_response = true;
+
+                 status = 'Snooze_user_manual_response';
+              }
+            }
+
     const existingRecord = db.prepare(`
       SELECT id FROM ai_message_queue
-      WHERE from_phone = ? and status  = 'Pending'
+      WHERE from_phone = ? and status in ('Pending','Snooze_user_manual_response')
       LIMIT 1
     `).get(from_phone);
 
@@ -688,7 +759,7 @@ const db = new Database(dbPath);
       const  insert = db.prepare(`
         update ai_message_queue set message = COALESCE(message, '') || '. ' ||  ?,
         updatedAt = ?,from_id = ?
-        where from_phone = ? and status  = 'Pending'
+        where from_phone = ? and status  in ('Pending','Snooze_user_manual_response')
     `);
 
       insert.run(
@@ -717,7 +788,7 @@ const db = new Database(dbPath);
             mensaje,
             to_phone,
             receiveDate,
-            'Pending' 
+            status 
         ); 
 
         }
@@ -773,6 +844,8 @@ const insertMessageStmt = db.prepare(`
   (receive_date, message, from_phone, to_phone, status,in_audio_path)
   VALUES (?, ?, ?, ?, ?,?)
 `);
+
+
 
 
   try {
@@ -834,14 +907,6 @@ const insertMessageStmt = db.prepare(`
 
     const mensajeGuardadoId = result.lastInsertRowid;
 
-
-    
-
-     
-   
-
-  
-
     /* ==============================
        Response
     ============================== */
@@ -849,10 +914,82 @@ const insertMessageStmt = db.prepare(`
     //enviar a cola de proceso para la IA 
     ai_send(cell_phone,mensajeGuardadoId,mensaje,to_phone) 
 
+
+    const findProspectByPhoneStmt = db.prepare(`
+      SELECT phone_number FROM prospect WHERE phone_number = ? or auto_match_phone = ?
+    `);
+
+    // Insert prospect
+    const insertProspectStmt = db.prepare(`
+      INSERT INTO prospect
+      (phone_number,createdAt, updatedAt)
+      VALUES (?, ?, ?)
+    `);
+
+    
+   const existingProspect = findProspectByPhoneStmt.get(cell_phone,cell_phone);
+
+    if (!existingProspect) {
+     
+      //verify auto_matcher_first
+
+       const auto_match = db.prepare(`
+        SELECT phone_inbound,phone_to 
+        FROM phone_automatic_match 
+        WHERE phone_inbound = ? or phone_to = ?
+      `).get(cell_phone,cell_phone);
+
+      if (!auto_match)
+         {
+            insertProspectStmt.run(
+            cell_phone,
+            receiveDate,
+            receiveDate
+          );
+         }
+      else 
+        {   
+
+            //keep update prospect contact
+
+              let numero_real = '';
+              let numero_encodeado =''; 
+                
+              if (auto_match?.phone_inbound.length > 12)
+                  numero_encodeado =  auto_match?.phone_inbound;
+              
+              if (auto_match?.phone_to.length > 12)
+                  numero_encodeado =  auto_match?.phone_to;
+
+              if (auto_match?.phone_inbound.length <= 12)
+                  numero_real =  auto_match?.phone_inbound;
+              
+              if (auto_match?.phone_to.length <= 12)
+                  numero_real =  auto_match?.phone_to;
+
+            
+              const updateProspectInteractionStmt = db.prepare(`
+              UPDATE prospect
+              SET 
+                phone_number = ?,
+                auto_match_phone = ?
+              WHERE phone_number = ? or auto_match_phone = ?
+              or phone_number = ? or auto_match_phone = ?
+            `);
+
+
+            updateProspectInteractionStmt.run(
+              numero_real, numero_encodeado,numero_real,numero_real,numero_encodeado,numero_encodeado
+              );
+        }   
+    }
+
+  
     rs.json({
       success: true,
       messageId: mensajeGuardadoId
     });
+
 
   } catch (error) {
 
@@ -994,6 +1131,8 @@ if (row?.param_value === 'ON') {
       LIMIT 1
     `).get(to_phone);
 
+
+    let matchPhone = ''; 
     
 
     if (existingRecord) {
@@ -1022,7 +1161,8 @@ if (row?.param_value === 'ON') {
       {
       
       try {
-      
+       
+
             const matcherDate = formatDateToYYYYMMDD(
               new Date().toLocaleString('en-US', { timeZone: 'America/Santo_Domingo' })
             );
@@ -1032,8 +1172,11 @@ if (row?.param_value === 'ON') {
               date_send: matcherDate
             });
 
-            const matchPhone = matcherResponse.data?.match_phone;
+          
 
+            matchPhone = matcherResponse.data?.match_phone;
+
+      
 
 
             if (matchPhone) 
@@ -1085,6 +1228,116 @@ if (row?.param_value === 'ON') {
 
       
     }
+
+    const findProspectByPhoneStmt = db.prepare(`
+      SELECT phone_number FROM prospect WHERE phone_number = ? or auto_match_phone = ?
+    `);
+
+        
+   const existingProspect = findProspectByPhoneStmt.get(cell_phone,cell_phone);
+
+    if (!existingProspect) {
+     
+      //verify auto_matcher_first
+
+       const auto_match = db.prepare(`
+        SELECT phone_inbound,phone_to 
+        FROM phone_automatic_match 
+        WHERE phone_inbound = ? or phone_to = ?
+      `).get(to_phone,to_phone);
+
+      if (auto_match)
+         {
+        
+
+            //keep update prospect contact
+
+              let numero_real = '';
+              let numero_encodeado =''; 
+                
+              if (auto_match?.phone_inbound.length > 12)
+                  numero_encodeado =  auto_match?.phone_inbound;
+              
+              if (auto_match?.phone_to.length > 12)
+                  numero_encodeado =  auto_match?.phone_to;
+
+              if (auto_match?.phone_inbound.length <= 12)
+                  numero_real =  auto_match?.phone_inbound;
+              
+              if (auto_match?.phone_to.length <= 12)
+                  numero_real =  auto_match?.phone_to;
+
+            
+              const updateProspectInteractionStmt = db.prepare(`
+              UPDATE prospect
+              SET 
+                last_interaction_date = ?,
+                last_interaction_comment = ?,
+                last_interaction_user = ?,
+                updatedAt = ?,
+                phone_number = ?,
+                auto_match_phone = ?
+              WHERE phone_number = ? or auto_match_phone = ?
+              or phone_number = ? or auto_match_phone = ?
+            `);
+
+
+            updateProspectInteractionStmt.run(
+              receiveDate,
+              mensaje,
+              cell_phone , 
+              receiveDate,
+              numero_real,
+              numero_encodeado,
+              numero_real,
+              numero_real,
+              numero_encodeado,
+              numero_encodeado
+              );
+        }   
+    }
+    else 
+    {
+
+        const updateProspectInteractionStmt = db.prepare(`
+          UPDATE prospect
+          SET 
+            last_interaction_date = ?,
+            last_interaction_comment = ?,
+            last_interaction_user = ?,
+            updatedAt = ?,
+            phone_number = ?
+            auto_match_phone = ?
+          WHERE phone_number = ? or auto_match_phone = ?
+        `);
+
+            
+
+        updateProspectInteractionStmt.run(
+        receiveDate,
+        mensaje,
+        cell_phone , 
+        receiveDate,
+        to_phone,
+        to_phone
+      );
+    }
+
+  //update AI_message_queue with human respond status
+
+  db.prepare(`
+      UPDATE ai_message_queue
+      SET status = ?
+      WHERE from_phone = ? and status IN ('Pending','Sent to AI','AI RESPOND ERROR RETRY','Snooze_user_manual_response') 
+    `).run('Completed. Manual human response',to_phone);
+
+  db.prepare(`
+      UPDATE whatsapp_Inbound_message_queue
+      SET status = ?
+      WHERE from_phone = ?  or auto_match_phone_response = ? and status IN ('Pending','Sent to AI','AI RESPOND ERROR RETRY','Snooze_user_manual_response') 
+    `).run('Completed',to_phone,to_phone);
+
+
 
     /* ==============================
        Response
@@ -1197,342 +1450,335 @@ async function getMessageCount(sessionId, role, content) {
 
 app.post("/aibres", async function (req, rs) {
 
-  
   const axios = require('axios');
   const Database = require('better-sqlite3');
 
-  // Open SQLite database
   const db = new Database(dbPath);
 
   let respond = '';
 
- 
-
   // Current timestamp
   const dateObj = new Date();
-  const sentToAiTime = formatDateToYYYYMMDD(dateObj.toLocaleString('en-US', { 
-    timeZone: 'America/Santo_Domingo' 
-  }));
+
+  const sentToAiTime = formatDateToYYYYMMDD(
+    dateObj.toLocaleString('en-US', { timeZone: 'America/Santo_Domingo' })
+  );
 
   // ===============================
-  // 1️⃣ GET CURRENT RECORD
+  // 1️⃣ GET ALL RECORDS
   // ===============================
-  const getStmt = db.prepare(`
+  const rows = db.prepare(`
     SELECT * 
     FROM ai_message_queue 
-    WHERE status in ('Pending','Sent to AI','AI RESPOND ERROR RETRY') 
-    order by id 
-  `);
+    WHERE status IN ('Pending','Sent to AI','AI RESPOND ERROR RETRY','Snooze_user_manual_response') 
+    ORDER BY id
+  `).all();
 
-  
-  const ordenes2 = getStmt.get();
-
-  if (!ordenes2) {
-
-   
- 
-    rs.status(200).json({
-      success: true,
-      error: 'Pending message not found'
-    });
-
-
-    return 'ok';
+  if (!rows || rows.length === 0) 
+  {
+    db.close();
+    
+    rs.status(200).json({ success: true, error: 'No messages found' });
+    return;
   }
 
-  
+  // ===============================
+  // PRELOAD WAIT TIME (OPTIMIZED)
+  // ===============================
+  const waitRow = db.prepare(`
+    SELECT param_value 
+    FROM local_setting 
+    WHERE param = 'WAIT_TIME_USER_MANUAL_RESPONSE'
+  `).get();
+
+  const waitMinutes = parseFloat(waitRow?.param_value) || 0;
+
+  let ordenes2 = null;
+
+  // ===============================
+  // 2️⃣ FIND FIRST VALID RECORD
+  // ===============================
+  for (const row of rows) {
+
+    if (row.status !== 'Snooze_user_manual_response') 
+      {
+        ordenes2 = row;
+        break;
+      }
+
+    if (row.status === 'Snooze_user_manual_response') {
+
+      const prospectRow = db.prepare(`
+        SELECT last_interaction_date 
+        FROM prospect 
+        WHERE phone_number = ? or auto_match_phone = ?
+      `).get(row.from_phone,row.from_phone);
+
+      if (prospectRow?.last_interaction_date) 
+        
+        {
+
+          const lastInteractionDate = new Date(prospectRow.last_interaction_date);
+
+          const now = new Date(
+            new Date().toLocaleString('en-US', { timeZone: 'America/Santo_Domingo' })
+          );
+
+          const diffMinutes = (now - lastInteractionDate) / (1000 * 60);
+
+          if (diffMinutes >= waitMinutes) 
+            {
+              ordenes2 = row;
+              break;
+            }
+      }
+    }
+  }
+
+  // ===============================
+  // NO VALID RECORD
+  // ===============================
+
+  if (!ordenes2) 
+     {
+   
+   
+        db.close();
+        
+        
+        rs.status(200).json({
+          success: true,
+          error: 'No eligible messages to process'
+        });
+        
+        return;
+     }
+
+  // ===============================
+  // EXTRACT DATA
+  // ===============================
+
+
   const id = ordenes2.id;
   const questionText = ordenes2.message;
   const from_phone = ordenes2.from_phone;
-  const original_sent_date =  ordenes2.sent_to_ai;
-  const from_id =  ordenes2.from_id;
-  const status =  ordenes2.status;
+  const original_sent_date = ordenes2.sent_to_ai;
+  const from_id = ordenes2.from_id;
+  const status = ordenes2.status;
 
-
-  const now = new Date();
-
- const server_date  = new Date(
-  now.toLocaleString('en-US', { timeZone: 'America/Santo_Domingo' })
-);
-
-  const sentDate = new Date(original_sent_date);
-  const diffMinutes = (server_date - sentDate) / 1000 / 60; // diferencia en minutos
-
-  if ((diffMinutes > 5) && (status == 'Sent to AI' || status == 'AI RESPOND ERROR RETRY'  ))  {
-     
-// ===============================
-  // 2️⃣ UPDATE STATUS -> ERROR
   // ===============================
-  const updateSentStmt = db.prepare(`
-    UPDATE ai_message_queue
-    SET status = ?, 
-        receive_from_ai = ?
-    WHERE id = ?
-  `);
-
-  updateSentStmt.run(
-    'AI_ERROR_TIME_OUT',
-    sentToAiTime,
-    id
-  );
-
+  // TIMEOUT CHECK
+  // ===============================
   
-  const updateCompletedStmt = db.prepare(`
-  UPDATE whatsapp_Inbound_message_queue
-  SET status = ?  
-  WHERE id <= ? and from_phone = ? and (status = 'Sent to AI' or status = 'AI RESPOND ERROR RETRY')
-  `);
-            
-
-  updateCompletedStmt.run(
-            'AI_ERROR_TIME_OUT',
-            from_id,
-            from_phone,
-           );
-
-
-  
-    rs.status(200).json({
-      success: false,
-      error: 'Error AI time_out'
-    });
-
-    return 'OK';
-     
-  }   
- 
-  if (status == 'Sent to AI')
+  if (original_sent_date) 
      {
-        rs.status(200).json({
-          success: false,
-          error: 'Processing previous AI messages. No action done'
-        });
+        const server_date = new Date(
+          new Date().toLocaleString('en-US', { timeZone: 'America/Santo_Domingo' })
+        );
 
-       return 'OK'; 
-     }
+        const sentDate = new Date(original_sent_date);
+    
+        const diffMinutes = (server_date - sentDate) / 1000 / 60;
 
+        if ( diffMinutes > 5 && (status === 'Sent to AI' || status === 'AI RESPOND ERROR RETRY')) 
+           {
+
+                  db.prepare(`
+                    UPDATE ai_message_queue
+                    SET status = ?, receive_from_ai = ?
+                    WHERE id = ?
+                  `).run('AI_ERROR_TIME_OUT', sentToAiTime, id);
+
+                  db.prepare(`
+                    UPDATE whatsapp_Inbound_message_queue
+                    SET status = ?
+                    WHERE id <= ? AND from_phone = ?
+                      AND (status = 'Sent to AI' OR status = 'AI RESPOND ERROR RETRY')
+                  `).run('AI_ERROR_TIME_OUT', from_id, from_phone);
+
+                  db.close();
+
+                  rs.status(200).json({
+                    success: false,
+                    error: 'Error AI time_out'
+                  });
+
+                  return;
+             }
+  }
+
+  // Prevent parallel AI calls
+  if (status === 'Sent to AI') {
+    
+      db.close();
+      
+      rs.status(200).json({
+        success: false,
+        error: 'Processing previous AI messages'
+      });
+
+      return;
+  }
 
   // ===============================
-  // 2️⃣ UPDATE STATUS -> set to AI
+  // SET STATUS → Sent to AI
   // ===============================
-  const updateSentStmt = db.prepare(`
+ 
+  db.prepare(`
     UPDATE ai_message_queue
     SET status = ?, 
         sent_to_ai = CASE 
-        WHEN sent_to_ai IS NULL THEN ? 
-        ELSE sent_to_ai 
-    END
+          WHEN sent_to_ai IS NULL THEN ? 
+          ELSE sent_to_ai 
+        END
     WHERE id = ?
-  `);
+  `).run('Sent to AI', sentToAiTime, id);
 
-  updateSentStmt.run(
-    'Sent to AI',
-    sentToAiTime,
-    id
-  );
-
-  
-  const updateSentToAIStmt = db.prepare(`
-  UPDATE whatsapp_Inbound_message_queue
-  SET status = ?,sent_to_ai = ? 
-  WHERE id <= ? and from_phone = ? and status = 'Pending'
-  `);
-            
-
-  updateSentToAIStmt.run(
-            'Sent to AI',
-            sentToAiTime,
-            from_id,
-            from_phone,
-           );
-  
- 
-
-
+  db.prepare(`
+    UPDATE whatsapp_Inbound_message_queue
+    SET status = ?, sent_to_ai = ?
+    WHERE id <= ? AND from_phone = ?
+      AND status IN ('Pending','Snooze_user_manual_response')
+  `).run('Sent to AI', sentToAiTime, from_id, from_phone);
 
   // ===============================
-  // 3️⃣ CALL AI SERVICE
+  // CALL AI
   // ===============================
-  let data = JSON.stringify({
-    session_id: ordenes2.from_phone,
-    question: questionText
-  });
-
-   
-  let config = {
-    method: 'post',
-    maxBodyLength: Infinity,
-    url: 'http://localhost:8964/ask',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(data),
-    },
-    data: data
-  };
-
+  
+  let respond_original = '';
 
   try {
-    const response = await axios.request(config);
     
+    
+    const response = await axios.post('http://localhost:8964/ask', {
+      session_id: from_phone,
+      question: questionText,
+      source: "whatsapp"
+    });
+
     respond_original = response.data.answer;
-
-    respond = await  cleanLLMSpam(ordenes2.from_phone,response.data.answer);
-
-    console.log('respond_original ' + respond_original);
-    console.log('respond ' + respond);
     
+    respond = await cleanLLMSpam(from_phone, respond_original);
 
   } catch (error) {
-    console.log(error);
-    console.log('error aibres ' + error.message);
+    console.log('AI error:', error.message);
   }
 
-        let history = [];
-        try {
+  let cantidad_mensaje = await getMessageCount(from_phone, 'assistant', respond);
+ 
+  let alreadyRespondedMoreThanOnce = cantidad_mensaje > 1;
 
-        } catch (err) {
-        console.log('Redis history error:', err.message);
-        }
+  // ===============================
+  // SUCCESS RESPONSE
+  // ===============================
 
-      var cantidad_mensaje  = 0;
-      
-      cantidad_mensaje =  await getMessageCount(ordenes2.from_phone,'assistant',respond);
-        
-       
-      alreadyRespondedMoreThanOnce = cantidad_mensaje > 1;
-       
-              
-     if (
-            respond_original &&
-            respond_original.trim() !== ''  
-
-            )
-     { 
-
-            // ===============================
-            // 4️⃣ UPDATE RECORD AFTER AI RESPONSE
-            // ===============================
-            const dateObj2 = new Date();
-            const receiveFromAiTime = formatDateToYYYYMMDD(dateObj2.toLocaleString('en-US', { 
-                timeZone: 'America/Santo_Domingo' 
-            }));
-
-            const diffMs = Math.abs(dateObj2 - dateObj);
-            const seconds = Math.floor(diffMs / 1000);
-
-            
-            const updateCompletedStmt = db.prepare(`
-                UPDATE whatsapp_Inbound_message_queue
-                SET automatic_ai_respond = ?, 
-                    status = ?, 
-                    ai_processing_time = ?, 
-                    receive_from_ai = ?
-                WHERE id <= ? and from_phone = ? and status = 'Sent to AI'
-            `);
-            
-            if  (respond.trim() == '')// after clean, all answer was not new
-                alreadyRespondedMoreThanOnce = true;
-                 
-
-            if (alreadyRespondedMoreThanOnce)
-               respond = 'Duplicated answer detected by model. Not sent to customer. Respond: ' + respond_original;
-
-           
-
-            updateCompletedStmt.run(
-                respond,
-                'Completed',
-                seconds.toString(),
-                receiveFromAiTime,
-                from_id,
-                from_phone,
-     
-            );
-
-
-
-             const updateAiCompletedStmt = db.prepare(`
-                UPDATE ai_message_queue
-                SET automatic_ai_respond = ?, 
-                    status = ?, 
-                    ai_processing_time = ?, 
-                    receive_from_ai = ?
-                WHERE id = ? and from_phone = ? and status = 'Sent to AI'
-            `);
-            
-
-
-            updateAiCompletedStmt.run(
-                respond,
-                'Completed',
-                seconds.toString(),
-                receiveFromAiTime,
-                id,
-                from_phone,
-     
-            );
-
-            
-            // ===============================
-            // 5️⃣ SEND WHATSAPP IF VALID RESPONSE
-            // ===============================
-            if (
-                respond && !respond.toLowerCase().includes('information not found') &&
-                respond !== 'MAX MESSAGE PER CUSTOMER REACHED' && 
-                !alreadyRespondedMoreThanOnce 
-                )   
-                {
-                whatsappsend(ordenes2.from_phone, respond, 'false', '8082');
-            }
-    }
-    else  
-      {
-        //reintentar llamado
-          // Enviar al webhook
-  
-        const dateObj2 = new Date();
-        const receiveFromAiTime = formatDateToYYYYMMDD(dateObj2.toLocaleString('en-US', { 
-                timeZone: 'America/Santo_Domingo' 
-            }));   
-
-        const updateCompletedStmt = db.prepare(`
-                UPDATE ai_message_queue
-                SET status = ?
-                WHERE id = ?
-            `);
-            
-
-
-            updateCompletedStmt.run(
-                'AI RESPOND ERROR RETRY',
-                id
-            );
+  if (respond_original && respond_original.trim() !== '') 
     
-       var dont_duplicate_text = '';
+    {
 
-       if (alreadyRespondedMoreThanOnce)
-          dont_duplicate_text = '\n \n give me a new respond different from: ' + respond;
+        const receiveFromAiTime = formatDateToYYYYMMDD(
+          new Date().toLocaleString('en-US', { timeZone: 'America/Santo_Domingo' })
+        );
 
-                
+          const seconds = Math.floor((new Date() - dateObj) / 1000);
+
+          if (respond.trim() === '') 
+            {
+              alreadyRespondedMoreThanOnce = true;
+            }
+
+    if (alreadyRespondedMoreThanOnce) 
+       {
+        respond = 'Duplicated answer detected. Not sent. Original: ' + respond_original;
+       }
+
+    
+    // UPDATE TABLES
+    
+    db.prepare(`
+      UPDATE whatsapp_Inbound_message_queue
+      SET automatic_ai_respond = ?, status = ?, ai_processing_time = ?, receive_from_ai = ?
+      WHERE id <= ? AND from_phone = ? AND status = 'Sent to AI'
+    `).run(respond, 'Completed', seconds.toString(), receiveFromAiTime, from_id, from_phone);
+
+    db.prepare(`
+      UPDATE ai_message_queue
+      SET automatic_ai_respond = ?, status = ?, ai_processing_time = ?, receive_from_ai = ?
+      WHERE id = ? AND from_phone = ?
+    `).run(respond, 'Completed', seconds.toString(), receiveFromAiTime, id, from_phone);
+
+    
+    
+    
+    //validate if no human respond send
+
+    var manual_response_detected = false;
+
+    const waitRow = db.prepare(`
+    SELECT param_value 
+    FROM local_setting 
+    WHERE param = 'WAIT_TIME_USER_MANUAL_RESPONSE'
+  `).get();
+
+    const waitMinutes = parseFloat(waitRow?.param_value) || 0;
 
 
-       await axios.post('http://localhost:8082/aibres', {
-       param1: questionText,
-       param2: id
-      });
+      const prospectRow = db.prepare(`
+        SELECT last_interaction_date 
+        FROM prospect 
+        WHERE phone_number = ? or auto_match_phone = ?
+      `).get(from_phone,from_phone);
 
+      if (prospectRow?.last_interaction_date) 
         
+        {
+
+          const lastInteractionDate = new Date(prospectRow.last_interaction_date);
+
+          const now = new Date(
+            new Date().toLocaleString('en-US', { timeZone: 'America/Santo_Domingo' })
+          );
+
+          const diffMinutes = (now - lastInteractionDate) / (1000 * 60);
+
+          if (diffMinutes < waitMinutes) 
+            {
+              manual_response_detected = true
+            }
+      }
 
 
-      }     
+    // SEND WHATSAPP
+    if (
+      respond &&
+      !respond.toLowerCase().includes('information not found') &&
+      respond !== 'MAX MESSAGE PER CUSTOMER REACHED' &&
+      !alreadyRespondedMoreThanOnce  && !manual_response_detected
+    ) {
+      whatsappsend(from_phone, respond, 'false', '8082');
+    }
 
-  // Close DB (optional but clean)
+  } else {
+
+    // RETRY
+    db.prepare(`
+      UPDATE ai_message_queue
+      SET status = ?
+      WHERE id = ?
+    `).run('AI RESPOND ERROR RETRY', id);
+
+    await axios.post('http://localhost:8082/aibres', {
+      param1: questionText,
+      param2: id
+    });
+  }
+
   db.close();
 
-     rs.status(200).json({
-      success: true,
-      error: 'Ok'
-    });
+  rs.status(200).json({
+    success: true,
+    error: 'Ok'
+  });
 
 });
 
